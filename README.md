@@ -23,7 +23,7 @@ A lightweight, embeddable Mongo-style document store for Kotlin/JVM apps. Optimi
 
 ### Dependencies
 
-Add to your `build.gradle.kts`:
+**Gradle (Kotlin DSL)**
 
 ```kotlin
 dependencies {
@@ -31,6 +31,38 @@ dependencies {
     implementation("com.sozocode:mini-leaf-jackson:1.6.11")
     implementation("com.sozocode:mini-leaf-kotlin:1.6.11")
 }
+```
+
+**Gradle (Groovy)**
+
+```groovy
+dependencies {
+    implementation 'com.sozocode:mini-leaf-core:1.6.11'
+    implementation 'com.sozocode:mini-leaf-jackson:1.6.11'
+    implementation 'com.sozocode:mini-leaf-kotlin:1.6.11'
+}
+```
+
+**Maven**
+
+```xml
+<dependencies>
+    <dependency>
+        <groupId>com.sozocode</groupId>
+        <artifactId>mini-leaf-core</artifactId>
+        <version>1.6.11</version>
+    </dependency>
+    <dependency>
+        <groupId>com.sozocode</groupId>
+        <artifactId>mini-leaf-jackson</artifactId>
+        <version>1.6.11</version>
+    </dependency>
+    <dependency>
+        <groupId>com.sozocode</groupId>
+        <artifactId>mini-leaf-kotlin</artifactId>
+        <version>1.6.11</version>
+    </dependency>
+</dependencies>
 ```
 
 ### Basic Usage
