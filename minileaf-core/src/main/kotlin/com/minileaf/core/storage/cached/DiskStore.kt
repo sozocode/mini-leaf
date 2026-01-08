@@ -2,7 +2,9 @@ package com.minileaf.core.storage.cached
 
 import com.fasterxml.jackson.databind.ObjectMapper
 import com.fasterxml.jackson.databind.node.ObjectNode
+import com.minileaf.core.crypto.Encryption
 import mu.KotlinLogging
+import java.io.ByteArrayOutputStream
 import java.io.RandomAccessFile
 import java.nio.ByteBuffer
 import java.nio.channels.FileChannel
@@ -33,12 +35,14 @@ import kotlin.concurrent.write
  * @param syncOnWrite If true, calls fsync after each write to ensure durability.
  *                    Set to false for better performance at the cost of potential data loss on crash.
  *                    Default is true for data safety.
+ * @param encryptionKey Optional 32-byte key for AES-256-GCM encryption. Null = no encryption.
  */
 class DiskStore<ID : Comparable<ID>>(
     private val dataFile: Path,
     private val idSerializer: (ID) -> String,
     private val idDeserializer: (String) -> ID,
-    private val syncOnWrite: Boolean = true
+    private val syncOnWrite: Boolean = true,
+    private val encryptionKey: ByteArray? = null
 ) {
     private val logger = KotlinLogging.logger {}
     private val mapper = ObjectMapper()
@@ -80,11 +84,20 @@ class DiskStore<ID : Comparable<ID>>(
         raf.seek(raf.length())
         val offset = raf.filePointer
 
-        // Write: [ID_LENGTH:4][ID_BYTES][DOC_LENGTH:4][DOC_BYTES]
-        raf.writeInt(idBytes.size)
-        raf.write(idBytes)
-        raf.writeInt(docBytes.size)
-        raf.write(docBytes)
+        if (encryptionKey != null) {
+            // Encrypted format: [TOTAL_LENGTH:4][ENCRYPTED_DATA]
+            // where ENCRYPTED_DATA contains encrypted [ID_LENGTH:4][ID_BYTES][DOC_LENGTH:4][DOC_BYTES]
+            val plainBytes = buildPlainEntry(idBytes, docBytes)
+            val encryptedBytes = Encryption.encrypt(plainBytes, encryptionKey)
+            raf.writeInt(encryptedBytes.size)
+            raf.write(encryptedBytes)
+        } else {
+            // Unencrypted format: [ID_LENGTH:4][ID_BYTES][DOC_LENGTH:4][DOC_BYTES]
+            raf.writeInt(idBytes.size)
+            raf.write(idBytes)
+            raf.writeInt(docBytes.size)
+            raf.write(docBytes)
+        }
 
         // Ensure data is persisted to disk before updating index
         // This prevents the scenario where index points to data that was never flushed
@@ -95,6 +108,18 @@ class DiskStore<ID : Comparable<ID>>(
         // Update index only after data is safely on disk
         index[id] = offset
         deletedIds.remove(id)
+    }
+
+    /**
+     * Builds a plain entry byte array: [ID_LENGTH:4][ID_BYTES][DOC_LENGTH:4][DOC_BYTES]
+     */
+    private fun buildPlainEntry(idBytes: ByteArray, docBytes: ByteArray): ByteArray {
+        val baos = ByteArrayOutputStream(4 + idBytes.size + 4 + docBytes.size)
+        baos.write(intToBytes(idBytes.size))
+        baos.write(idBytes)
+        baos.write(intToBytes(docBytes.size))
+        baos.write(docBytes)
+        return baos.toByteArray()
     }
 
     /**
@@ -150,54 +175,101 @@ class DiskStore<ID : Comparable<ID>>(
         return try {
             val channel = raf.channel
 
-            // Read ID length (4 bytes)
-            val idLengthBuffer = ByteBuffer.allocate(4)
-            val idLengthRead = channel.read(idLengthBuffer, offset)
-            if (idLengthRead < 4) {
-                logger.warn { "Failed to read ID length at offset $offset" }
-                return null
-            }
-            idLengthBuffer.flip()
-            val idLength = idLengthBuffer.int
+            if (encryptionKey != null) {
+                // Encrypted format: [TOTAL_LENGTH:4][ENCRYPTED_DATA]
+                val lengthBuffer = ByteBuffer.allocate(4)
+                val lengthRead = channel.read(lengthBuffer, offset)
+                if (lengthRead < 4) {
+                    logger.warn { "Failed to read encrypted length at offset $offset" }
+                    return null
+                }
+                lengthBuffer.flip()
+                val encryptedLength = lengthBuffer.int
 
-            // Sanity check: idLength should be reasonable
-            if (idLength < 0 || idLength > maxIdLength) {
-                logger.warn { "Invalid ID length at offset $offset: $idLength" }
-                return null
-            }
+                if (encryptedLength < 0 || encryptedLength > maxDocLength + maxIdLength + 100) {
+                    logger.warn { "Invalid encrypted length at offset $offset: $encryptedLength" }
+                    return null
+                }
 
-            // Read doc length (4 bytes) - skip ID bytes
-            val docLengthBuffer = ByteBuffer.allocate(4)
-            val docLengthRead = channel.read(docLengthBuffer, offset + 4 + idLength)
-            if (docLengthRead < 4) {
-                logger.warn { "Failed to read doc length at offset $offset" }
-                return null
-            }
-            docLengthBuffer.flip()
-            val docLength = docLengthBuffer.int
+                val encryptedBuffer = ByteBuffer.allocate(encryptedLength)
+                val encryptedRead = channel.read(encryptedBuffer, offset + 4)
+                if (encryptedRead < encryptedLength) {
+                    logger.warn { "Failed to read encrypted data at offset $offset" }
+                    return null
+                }
+                encryptedBuffer.flip()
+                val encryptedBytes = ByteArray(encryptedLength)
+                encryptedBuffer.get(encryptedBytes)
 
-            // Sanity check: docLength should be reasonable
-            if (docLength < 0 || docLength > maxDocLength) {
-                logger.warn { "Invalid document length at offset $offset: $docLength" }
-                return null
-            }
+                val decryptedBytes = Encryption.decrypt(encryptedBytes, encryptionKey)
+                return parseDecryptedEntry(decryptedBytes)
+            } else {
+                // Unencrypted format: [ID_LENGTH:4][ID_BYTES][DOC_LENGTH:4][DOC_BYTES]
+                // Read ID length (4 bytes)
+                val idLengthBuffer = ByteBuffer.allocate(4)
+                val idLengthRead = channel.read(idLengthBuffer, offset)
+                if (idLengthRead < 4) {
+                    logger.warn { "Failed to read ID length at offset $offset" }
+                    return null
+                }
+                idLengthBuffer.flip()
+                val idLength = idLengthBuffer.int
 
-            // Read document bytes
-            val docBuffer = ByteBuffer.allocate(docLength)
-            val docRead = channel.read(docBuffer, offset + 4 + idLength + 4)
-            if (docRead < docLength) {
-                logger.warn { "Failed to read document bytes at offset $offset: expected $docLength, got $docRead" }
-                return null
-            }
-            docBuffer.flip()
-            val docBytes = ByteArray(docLength)
-            docBuffer.get(docBytes)
+                // Sanity check: idLength should be reasonable
+                if (idLength < 0 || idLength > maxIdLength) {
+                    logger.warn { "Invalid ID length at offset $offset: $idLength" }
+                    return null
+                }
 
-            mapper.readTree(docBytes) as ObjectNode
+                // Read doc length (4 bytes) - skip ID bytes
+                val docLengthBuffer = ByteBuffer.allocate(4)
+                val docLengthRead = channel.read(docLengthBuffer, offset + 4 + idLength)
+                if (docLengthRead < 4) {
+                    logger.warn { "Failed to read doc length at offset $offset" }
+                    return null
+                }
+                docLengthBuffer.flip()
+                val docLength = docLengthBuffer.int
+
+                // Sanity check: docLength should be reasonable
+                if (docLength < 0 || docLength > maxDocLength) {
+                    logger.warn { "Invalid document length at offset $offset: $docLength" }
+                    return null
+                }
+
+                // Read document bytes
+                val docBuffer = ByteBuffer.allocate(docLength)
+                val docRead = channel.read(docBuffer, offset + 4 + idLength + 4)
+                if (docRead < docLength) {
+                    logger.warn { "Failed to read document bytes at offset $offset: expected $docLength, got $docRead" }
+                    return null
+                }
+                docBuffer.flip()
+                val docBytes = ByteArray(docLength)
+                docBuffer.get(docBytes)
+
+                mapper.readTree(docBytes) as ObjectNode
+            }
         } catch (e: Exception) {
             logger.error(e) { "Failed to read document at offset $offset" }
             null
         }
+    }
+
+    /**
+     * Parses a decrypted entry byte array to extract the document.
+     */
+    private fun parseDecryptedEntry(decryptedBytes: ByteArray): ObjectNode? {
+        if (decryptedBytes.size < 8) return null
+
+        val idLength = bytesToInt(decryptedBytes.copyOfRange(0, 4))
+        if (idLength < 0 || idLength > maxIdLength || 4 + idLength + 4 > decryptedBytes.size) return null
+
+        val docLength = bytesToInt(decryptedBytes.copyOfRange(4 + idLength, 4 + idLength + 4))
+        if (docLength < 0 || docLength > maxDocLength || 4 + idLength + 4 + docLength > decryptedBytes.size) return null
+
+        val docBytes = decryptedBytes.copyOfRange(4 + idLength + 4, 4 + idLength + 4 + docLength)
+        return mapper.readTree(docBytes) as ObjectNode
     }
 
     /**
@@ -222,11 +294,19 @@ class DiskStore<ID : Comparable<ID>>(
             // Append to end of file
             raf.seek(raf.length())
 
-            // Write: [ID_LENGTH:4][ID_BYTES][DOC_LENGTH:4][DELETION_MARKER]
-            raf.writeInt(idBytes.size)
-            raf.write(idBytes)
-            raf.writeInt(deletionMarker.size)
-            raf.write(deletionMarker)
+            if (encryptionKey != null) {
+                // Encrypted format
+                val plainBytes = buildPlainEntry(idBytes, deletionMarker)
+                val encryptedBytes = Encryption.encrypt(plainBytes, encryptionKey)
+                raf.writeInt(encryptedBytes.size)
+                raf.write(encryptedBytes)
+            } else {
+                // Unencrypted format: [ID_LENGTH:4][ID_BYTES][DOC_LENGTH:4][DELETION_MARKER]
+                raf.writeInt(idBytes.size)
+                raf.write(idBytes)
+                raf.writeInt(deletionMarker.size)
+                raf.write(deletionMarker)
+            }
 
             // Ensure deletion marker is persisted
             if (syncOnWrite) {
@@ -379,10 +459,19 @@ class DiskStore<ID : Comparable<ID>>(
 
                     val newOffset = tempRaf.filePointer
 
-                    tempRaf.writeInt(idBytes.size)
-                    tempRaf.write(idBytes)
-                    tempRaf.writeInt(docBytes.size)
-                    tempRaf.write(docBytes)
+                    if (encryptionKey != null) {
+                        // Encrypted format
+                        val plainBytes = buildPlainEntry(idBytes, docBytes)
+                        val encryptedBytes = Encryption.encrypt(plainBytes, encryptionKey)
+                        tempRaf.writeInt(encryptedBytes.size)
+                        tempRaf.write(encryptedBytes)
+                    } else {
+                        // Unencrypted format
+                        tempRaf.writeInt(idBytes.size)
+                        tempRaf.write(idBytes)
+                        tempRaf.writeInt(docBytes.size)
+                        tempRaf.write(docBytes)
+                    }
 
                     newIndex[id] = newOffset
                 } else {
@@ -429,23 +518,39 @@ class DiskStore<ID : Comparable<ID>>(
         return try {
             raf.seek(offset)
 
-            val idLength = raf.readInt()
-            if (idLength < 0 || idLength > maxIdLength) {
-                logger.warn { "Invalid ID length during compaction at offset $offset: $idLength" }
-                return null
+            if (encryptionKey != null) {
+                // Encrypted format: [TOTAL_LENGTH:4][ENCRYPTED_DATA]
+                val encryptedLength = raf.readInt()
+                if (encryptedLength < 0 || encryptedLength > maxDocLength + maxIdLength + 100) {
+                    logger.warn { "Invalid encrypted length during compaction at offset $offset: $encryptedLength" }
+                    return null
+                }
+
+                val encryptedBytes = ByteArray(encryptedLength)
+                raf.readFully(encryptedBytes)
+
+                val decryptedBytes = Encryption.decrypt(encryptedBytes, encryptionKey)
+                return parseDecryptedEntry(decryptedBytes)
+            } else {
+                // Unencrypted format
+                val idLength = raf.readInt()
+                if (idLength < 0 || idLength > maxIdLength) {
+                    logger.warn { "Invalid ID length during compaction at offset $offset: $idLength" }
+                    return null
+                }
+
+                raf.skipBytes(idLength)
+
+                val docLength = raf.readInt()
+                if (docLength < 0 || docLength > maxDocLength) {
+                    logger.warn { "Invalid doc length during compaction at offset $offset: $docLength" }
+                    return null
+                }
+
+                val docBytes = ByteArray(docLength)
+                raf.readFully(docBytes)
+                mapper.readTree(docBytes) as ObjectNode
             }
-
-            raf.skipBytes(idLength)
-
-            val docLength = raf.readInt()
-            if (docLength < 0 || docLength > maxDocLength) {
-                logger.warn { "Invalid doc length during compaction at offset $offset: $docLength" }
-                return null
-            }
-
-            val docBytes = ByteArray(docLength)
-            raf.readFully(docBytes)
-            mapper.readTree(docBytes) as ObjectNode
         } catch (e: Exception) {
             logger.warn { "Failed to read document at offset $offset during compaction: ${e.message}" }
             null
@@ -484,40 +589,66 @@ class DiskStore<ID : Comparable<ID>>(
             val offset = raf.filePointer
 
             try {
-                // Read: [ID_LENGTH:4][ID_BYTES][DOC_LENGTH:4][DOC_BYTES]
-                val idLength = raf.readInt()
+                if (encryptionKey != null) {
+                    // Encrypted format: [TOTAL_LENGTH:4][ENCRYPTED_DATA]
+                    val encryptedLength = raf.readInt()
+                    if (encryptedLength < 0 || encryptedLength > maxDocLength + maxIdLength + 100) {
+                        logger.error { "Invalid encrypted length at offset $offset: $encryptedLength, stopping index build" }
+                        break
+                    }
 
-                // Sanity check
-                if (idLength < 0 || idLength > maxIdLength) {
-                    logger.error { "Invalid ID length at offset $offset: $idLength, stopping index build" }
-                    break
-                }
+                    val encryptedBytes = ByteArray(encryptedLength)
+                    raf.readFully(encryptedBytes)
 
-                val idBytes = ByteArray(idLength)
-                raf.readFully(idBytes)
-                val idString = String(idBytes, Charsets.UTF_8)
-                val id = idDeserializer(idString)
-
-                val docLength = raf.readInt()
-
-                // Sanity check
-                if (docLength < 0 || docLength > maxDocLength) {
-                    logger.error { "Invalid doc length at offset $offset: $docLength, stopping index build" }
-                    break
-                }
-
-                val docBytes = ByteArray(docLength)
-                raf.readFully(docBytes)
-
-                // Check if this is a deletion marker (empty JSON object: {})
-                if (docLength == 2 && docBytes[0] == '{'.code.toByte() && docBytes[1] == '}'.code.toByte()) {
-                    // This is a deletion marker
-                    deletionMarkers.add(id)
-                    allEntries.remove(id) // Remove from index if it was there
+                    val decryptedBytes = Encryption.decrypt(encryptedBytes, encryptionKey)
+                    val parsed = parseDecryptedEntryWithId(decryptedBytes)
+                    if (parsed != null) {
+                        val (id, docBytes) = parsed
+                        // Check if this is a deletion marker (empty JSON object: {})
+                        if (docBytes.size == 2 && docBytes[0] == '{'.code.toByte() && docBytes[1] == '}'.code.toByte()) {
+                            deletionMarkers.add(id)
+                            allEntries.remove(id)
+                        } else {
+                            allEntries[id] = offset
+                            deletionMarkers.remove(id)
+                        }
+                    }
                 } else {
-                    // Normal document - only add if not marked as deleted later
-                    allEntries[id] = offset
-                    deletionMarkers.remove(id) // Clear any previous deletion marker
+                    // Unencrypted format: [ID_LENGTH:4][ID_BYTES][DOC_LENGTH:4][DOC_BYTES]
+                    val idLength = raf.readInt()
+
+                    // Sanity check
+                    if (idLength < 0 || idLength > maxIdLength) {
+                        logger.error { "Invalid ID length at offset $offset: $idLength, stopping index build" }
+                        break
+                    }
+
+                    val idBytes = ByteArray(idLength)
+                    raf.readFully(idBytes)
+                    val idString = String(idBytes, Charsets.UTF_8)
+                    val id = idDeserializer(idString)
+
+                    val docLength = raf.readInt()
+
+                    // Sanity check
+                    if (docLength < 0 || docLength > maxDocLength) {
+                        logger.error { "Invalid doc length at offset $offset: $docLength, stopping index build" }
+                        break
+                    }
+
+                    val docBytes = ByteArray(docLength)
+                    raf.readFully(docBytes)
+
+                    // Check if this is a deletion marker (empty JSON object: {})
+                    if (docLength == 2 && docBytes[0] == '{'.code.toByte() && docBytes[1] == '}'.code.toByte()) {
+                        // This is a deletion marker
+                        deletionMarkers.add(id)
+                        allEntries.remove(id) // Remove from index if it was there
+                    } else {
+                        // Normal document - only add if not marked as deleted later
+                        allEntries[id] = offset
+                        deletionMarkers.remove(id) // Clear any previous deletion marker
+                    }
                 }
 
                 count++
@@ -539,5 +670,48 @@ class DiskStore<ID : Comparable<ID>>(
         }
 
         logger.info { "Index built: ${index.size} active documents, ${deletedIds.size} deleted, from $count entries (skipped: $skipped)" }
+    }
+
+    /**
+     * Parses a decrypted entry to extract both ID and document bytes.
+     */
+    private fun parseDecryptedEntryWithId(decryptedBytes: ByteArray): Pair<ID, ByteArray>? {
+        if (decryptedBytes.size < 8) return null
+
+        val idLength = bytesToInt(decryptedBytes.copyOfRange(0, 4))
+        if (idLength < 0 || idLength > maxIdLength || 4 + idLength + 4 > decryptedBytes.size) return null
+
+        val idBytes = decryptedBytes.copyOfRange(4, 4 + idLength)
+        val idString = String(idBytes, Charsets.UTF_8)
+        val id = idDeserializer(idString)
+
+        val docLength = bytesToInt(decryptedBytes.copyOfRange(4 + idLength, 4 + idLength + 4))
+        if (docLength < 0 || docLength > maxDocLength || 4 + idLength + 4 + docLength > decryptedBytes.size) return null
+
+        val docBytes = decryptedBytes.copyOfRange(4 + idLength + 4, 4 + idLength + 4 + docLength)
+        return id to docBytes
+    }
+
+    /**
+     * Converts an integer to a 4-byte array (big-endian).
+     */
+    private fun intToBytes(value: Int): ByteArray {
+        return byteArrayOf(
+            (value shr 24).toByte(),
+            (value shr 16).toByte(),
+            (value shr 8).toByte(),
+            value.toByte()
+        )
+    }
+
+    /**
+     * Converts a 4-byte array (big-endian) to an integer.
+     */
+    private fun bytesToInt(bytes: ByteArray): Int {
+        require(bytes.size == 4) { "Expected 4 bytes" }
+        return ((bytes[0].toInt() and 0xFF) shl 24) or
+               ((bytes[1].toInt() and 0xFF) shl 16) or
+               ((bytes[2].toInt() and 0xFF) shl 8) or
+               (bytes[3].toInt() and 0xFF)
     }
 }

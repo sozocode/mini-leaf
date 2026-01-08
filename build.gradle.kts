@@ -5,7 +5,7 @@ plugins {
 
 allprojects {
     group = "com.sozocode"
-    version = "1.6.11"
+    version = "1.6.13"
 
     repositories {
         mavenCentral()

@@ -71,11 +71,12 @@ class CachedStorageEngine<ID : Comparable<ID>>(
         dataDir.toFile().mkdirs()
 
         val dataFile = dataDir.resolve("$collectionName.data")
-        diskStore = DiskStore(dataFile, idSerializer, idDeserializer, config.syncOnWrite)
+        diskStore = DiskStore(dataFile, idSerializer, idDeserializer, config.syncOnWrite, config.encryptionKey)
 
+        val encryptionStatus = if (config.encryptionKey != null) "enabled" else "disabled"
         logger.info {
             "Initialized cached storage for collection '$collectionName' " +
-                    "(cache: $cacheSize docs, disk: ${diskStore.count()} docs)"
+                    "(cache: $cacheSize docs, disk: ${diskStore.count()} docs, encryption: $encryptionStatus)"
         }
     }
 

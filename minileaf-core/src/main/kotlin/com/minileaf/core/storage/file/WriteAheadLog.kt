@@ -94,7 +94,10 @@ class WriteAheadLog<ID : Any>(
             val bytes = (json + "\n").toByteArray(Charsets.UTF_8)
 
             val finalBytes = if (encryptionKey != null) {
-                encrypt(bytes, encryptionKey)
+                val encrypted = encrypt(bytes, encryptionKey)
+                // Prepend 4-byte length so we can read each encrypted block separately
+                val lengthBytes = intToBytes(encrypted.size)
+                lengthBytes + encrypted
             } else {
                 bytes
             }
@@ -118,13 +121,23 @@ class WriteAheadLog<ID : Any>(
             if (!file.exists()) return emptyList()
 
             val lines = if (encryptionKey != null) {
-                // Decrypt and read
-                val encryptedBytes = file.readBytes()
-                if (encryptedBytes.isEmpty()) {
+                // Read each encrypted block separately using length prefix
+                val allBytes = file.readBytes()
+                if (allBytes.isEmpty()) {
                     emptyList()
                 } else {
-                    val decryptedBytes = decrypt(encryptedBytes, encryptionKey)
-                    String(decryptedBytes, Charsets.UTF_8).lines()
+                    val decryptedLines = mutableListOf<String>()
+                    var offset = 0
+                    while (offset + 4 <= allBytes.size) {
+                        val length = bytesToInt(allBytes.copyOfRange(offset, offset + 4))
+                        offset += 4
+                        if (offset + length > allBytes.size) break
+                        val encryptedBlock = allBytes.copyOfRange(offset, offset + length)
+                        offset += length
+                        val decrypted = decrypt(encryptedBlock, encryptionKey)
+                        decryptedLines.add(String(decrypted, Charsets.UTF_8).trim())
+                    }
+                    decryptedLines
                 }
             } else {
                 file.readLines(Charsets.UTF_8)
@@ -245,5 +258,28 @@ class WriteAheadLog<ID : Any>(
      */
     private fun decrypt(data: ByteArray, key: ByteArray): ByteArray {
         return Encryption.decrypt(data, key)
+    }
+
+    /**
+     * Converts an integer to a 4-byte array (big-endian).
+     */
+    private fun intToBytes(value: Int): ByteArray {
+        return byteArrayOf(
+            (value shr 24).toByte(),
+            (value shr 16).toByte(),
+            (value shr 8).toByte(),
+            value.toByte()
+        )
+    }
+
+    /**
+     * Converts a 4-byte array (big-endian) to an integer.
+     */
+    private fun bytesToInt(bytes: ByteArray): Int {
+        require(bytes.size == 4) { "Expected 4 bytes" }
+        return ((bytes[0].toInt() and 0xFF) shl 24) or
+               ((bytes[1].toInt() and 0xFF) shl 16) or
+               ((bytes[2].toInt() and 0xFF) shl 8) or
+               (bytes[3].toInt() and 0xFF)
     }
 }
