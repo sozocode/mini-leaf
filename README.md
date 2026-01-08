@@ -27,9 +27,9 @@ A lightweight, embeddable Mongo-style document store for Kotlin/JVM apps. Optimi
 
 ```kotlin
 dependencies {
-    implementation("com.sozocode:mini-leaf-core:1.6.11")
-    implementation("com.sozocode:mini-leaf-jackson:1.6.11")
-    implementation("com.sozocode:mini-leaf-kotlin:1.6.11")
+    implementation("com.sozocode:mini-leaf-core:1.6.13")
+    implementation("com.sozocode:mini-leaf-jackson:1.6.13")
+    implementation("com.sozocode:mini-leaf-kotlin:1.6.13")
 }
 ```
 
@@ -37,9 +37,9 @@ dependencies {
 
 ```groovy
 dependencies {
-    implementation 'com.sozocode:mini-leaf-core:1.6.11'
-    implementation 'com.sozocode:mini-leaf-jackson:1.6.11'
-    implementation 'com.sozocode:mini-leaf-kotlin:1.6.11'
+    implementation 'com.sozocode:mini-leaf-core:1.6.13'
+    implementation 'com.sozocode:mini-leaf-jackson:1.6.13'
+    implementation 'com.sozocode:mini-leaf-kotlin:1.6.13'
 }
 ```
 
@@ -50,17 +50,17 @@ dependencies {
     <dependency>
         <groupId>com.sozocode</groupId>
         <artifactId>mini-leaf-core</artifactId>
-        <version>1.6.11</version>
+        <version>1.6.13</version>
     </dependency>
     <dependency>
         <groupId>com.sozocode</groupId>
         <artifactId>mini-leaf-jackson</artifactId>
-        <version>1.6.11</version>
+        <version>1.6.13</version>
     </dependency>
     <dependency>
         <groupId>com.sozocode</groupId>
         <artifactId>mini-leaf-kotlin</artifactId>
-        <version>1.6.11</version>
+        <version>1.6.13</version>
     </dependency>
 </dependencies>
 ```
