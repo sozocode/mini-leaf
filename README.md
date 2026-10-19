@@ -418,6 +418,45 @@ println("Indexes: ${stats.indexCount}")
 db.collection("users").compact()
 ```
 
+### Automatic compaction (cached storage)
+
+Cached storage (`cacheSize` set) is an append-only log: every update and delete appends a new
+record and leaves the old one in place. Without compaction a collection that is rewritten on a
+timer grows without bound — hundreds of megabytes for a few kilobytes of live data, all of it
+decrypted again on every open.
+
+Compaction is therefore automatic. A background thread per collection checks on a fixed delay,
+and once at open, and rewrites the file with only the live records when it is both large enough
+and bloated enough:
+
+```kotlin
+val config = MinileafConfig(
+    cacheSize = 10_000,
+    autoCompactEnabled = true,                  // default
+    autoCompactIntervalMs = 5 * 60 * 1000,      // check every 5 minutes
+    autoCompactMinBytes = 8L * 1024 * 1024,     // never bother below 8 MB
+    autoCompactBloatRatio = 4.0                 // run once 3/4 of the file is dead
+)
+```
+
+The file swap is a single atomic rename, and an interrupted compaction is recovered on the next
+open, so a crash at any point leaves either the old file or the new one, never neither. The
+on-disk format is unchanged: a compacted file is readable by every earlier release.
+
+### Damage recovery and the data-directory lock
+
+On open, a record whose framing is intact but whose payload will not decrypt or parse is skipped
+and reclaimed by the next compaction. A record whose framing is lost — a torn write from a
+crash or a full disk — ends the readable part of the file: the unreadable tail is moved to a
+`<collection>.data.damaged-<timestamp>` sidecar and the file is truncated there, so later writes
+land at a readable boundary instead of being stranded behind the damage. Nothing is deleted;
+the sidecar can be inspected or removed by hand. An append that fails partway (disk full) is
+rolled back immediately, so a torn record never lands in the middle of a file.
+
+Opening a persistent store takes an OS-level lock on `<dataDir>/minileaf.lock`. A second
+process opening the same directory fails immediately with the holder's PID rather than
+silently sharing files with it (`lockDataDir = false` disables this for read-only tooling).
+
 ## Encryption
 
 ```kotlin

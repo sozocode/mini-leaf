@@ -3,13 +3,18 @@ package com.minileaf.core.storage.cached
 import com.fasterxml.jackson.databind.ObjectMapper
 import com.fasterxml.jackson.databind.node.ObjectNode
 import com.minileaf.core.crypto.Encryption
+import com.minileaf.core.exception.StorageException
 import mu.KotlinLogging
 import java.io.ByteArrayOutputStream
 import java.io.RandomAccessFile
 import java.nio.ByteBuffer
 import java.nio.channels.FileChannel
+import java.nio.file.AtomicMoveNotSupportedException
+import java.nio.file.Files
 import java.nio.file.Path
+import java.nio.file.StandardCopyOption
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.locks.ReentrantReadWriteLock
 import kotlin.concurrent.read
 import kotlin.concurrent.write
@@ -62,12 +67,83 @@ class DiskStore<ID : Comparable<ID>>(
     private val maxIdLength = 10_000          // 10KB max for ID
     private val maxDocLength = 100 * 1024 * 1024  // 100MB max for document
 
+    // Smallest length prefixes a genuine record can carry. Anything below is framing damage,
+    // not a short document: without these floors a run of zero bytes (what a disk-full write or
+    // a sparse preallocation leaves behind) parses as an endless series of empty "records".
+    //   encrypted: 12-byte IV + 16-byte GCM tag + [ID_LENGTH:4][DOC_LENGTH:4] with nothing in them
+    //   plain:     an ID is at least one byte, a document at least "{}"
+    private val minEncryptedLength = 12 + 16 + 8
+    private val minIdLength = 1
+    private val minDocLength = 2
+
+    // Test hook: invoked after a record's length prefix has been written but before its payload,
+    // so a test can fail an append halfway and prove the file is rolled back. Never set in
+    // production.
+    internal var afterPartialAppendHook: (() -> Unit)? = null
+
+    // Records whose framing was intact but whose payload would not decrypt or parse during the
+    // last index build. They are skipped, not fatal; compaction drops them.
+    @Volatile
+    private var corruptEntries: Int = 0
+
+    // Scratch file compaction writes before swapping it over dataFile.
+    private val compactTempFile: Path = dataFile.resolveSibling("${dataFile.fileName}.compact")
+
+    // Total entries physically present in the file (live documents, superseded versions and
+    // tombstones alike). Seeded by buildIndex(), incremented per append, reset by compact().
+    // Drives bloatRatio(), which is how callers decide when compaction is worth doing.
+    private val appendCount = AtomicLong(0)
+
+    // False when buildIndex() hit a damaged record and stopped early, meaning some suffix of
+    // the file is present on disk but absent from the index. Compaction MUST NOT run in that
+    // state: it rewrites the file from the index and would make the loss permanent.
+    @Volatile
+    private var indexComplete: Boolean = true
+
+    // Offset of the record that stopped the index build, or -1 when the index is complete.
+    @Volatile
+    private var incompleteTailOffset: Long = -1
+
     init {
         dataFile.parent?.toFile()?.mkdirs()
+        recoverInterruptedCompaction()
         raf = RandomAccessFile(dataFile.toFile(), "rw")
 
         // Build index by scanning the file
         buildIndex()
+    }
+
+    /**
+     * Recovers from a compaction that was interrupted before its file swap completed.
+     *
+     * Older versions swapped by deleting [dataFile] and then renaming the temp file over it,
+     * so a crash between those two steps left the collection with no data file and a complete
+     * `.compact` file nobody looked at. compact() now swaps atomically, but installs damaged
+     * by the old behaviour still need rescuing, and an aborted temp write still leaves litter.
+     *
+     * Decision rule: the data file wins whenever it holds anything, because compaction only
+     * ever swaps in a temp file it has already fsynced. A missing or empty data file next to a
+     * temp file means the swap did not finish.
+     */
+    private fun recoverInterruptedCompaction() {
+        if (!Files.exists(compactTempFile)) return
+
+        val dataPresent = Files.exists(dataFile) && Files.size(dataFile) > 0L
+        if (dataPresent) {
+            logger.warn {
+                "Discarding stale compaction temp file ${compactTempFile.fileName} " +
+                        "(${Files.size(compactTempFile)} bytes); ${dataFile.fileName} is intact"
+            }
+            runCatching { Files.deleteIfExists(compactTempFile) }
+                .onFailure { logger.error(it) { "Failed to delete stale temp file" } }
+            return
+        }
+
+        logger.warn {
+            "Recovering interrupted compaction: promoting ${compactTempFile.fileName} " +
+                    "(${Files.size(compactTempFile)} bytes) to ${dataFile.fileName}"
+        }
+        atomicMove(compactTempFile, dataFile)
     }
 
     /**
@@ -84,16 +160,40 @@ class DiskStore<ID : Comparable<ID>>(
         raf.seek(raf.length())
         val offset = raf.filePointer
 
+        try {
+            appendRecord(idBytes, docBytes)
+        } catch (e: Exception) {
+            // A failed append (disk full, I/O error) may have left part of a record on disk.
+            // Remove it NOW, while we still know where it starts. Left in place, the next append
+            // would land after it and every record from here on would be unreachable at the next
+            // open, because the index build cannot read past a torn record.
+            rollbackPartialAppend(offset, e)
+            throw e
+        }
+
+        // Update index only after data is safely on disk
+        index[id] = offset
+        deletedIds.remove(id)
+        appendCount.incrementAndGet()
+    }
+
+    /**
+     * Writes one record at the current file position and, when [syncOnWrite] is set, fsyncs it.
+     * The caller has already positioned [raf] at the end of the file.
+     */
+    private fun appendRecord(idBytes: ByteArray, docBytes: ByteArray) {
         if (encryptionKey != null) {
             // Encrypted format: [TOTAL_LENGTH:4][ENCRYPTED_DATA]
             // where ENCRYPTED_DATA contains encrypted [ID_LENGTH:4][ID_BYTES][DOC_LENGTH:4][DOC_BYTES]
             val plainBytes = buildPlainEntry(idBytes, docBytes)
             val encryptedBytes = Encryption.encrypt(plainBytes, encryptionKey)
             raf.writeInt(encryptedBytes.size)
+            afterPartialAppendHook?.invoke()
             raf.write(encryptedBytes)
         } else {
             // Unencrypted format: [ID_LENGTH:4][ID_BYTES][DOC_LENGTH:4][DOC_BYTES]
             raf.writeInt(idBytes.size)
+            afterPartialAppendHook?.invoke()
             raf.write(idBytes)
             raf.writeInt(docBytes.size)
             raf.write(docBytes)
@@ -104,10 +204,33 @@ class DiskStore<ID : Comparable<ID>>(
         if (syncOnWrite) {
             raf.fd.sync()
         }
+    }
 
-        // Update index only after data is safely on disk
-        index[id] = offset
-        deletedIds.remove(id)
+    /**
+     * Truncates the file back to [offset] after an append failed partway.
+     *
+     * Best effort: on a full disk the truncation itself frees space and normally succeeds. If it
+     * does not, the torn record stays on disk and [buildIndex] quarantines it at the next open,
+     * so the failure is contained either way.
+     */
+    private fun rollbackPartialAppend(offset: Long, cause: Exception) {
+        try {
+            if (raf.length() > offset) {
+                raf.setLength(offset)
+                if (syncOnWrite) {
+                    raf.fd.sync()
+                }
+            }
+            logger.warn(cause) {
+                "Append to ${dataFile.fileName} at offset $offset failed; the partial record was removed " +
+                        "so the file stays consistent"
+            }
+        } catch (t: Exception) {
+            logger.error(t) {
+                "Append to ${dataFile.fileName} at offset $offset failed AND the partial record could not " +
+                        "be removed; it will be quarantined when the store is next opened"
+            }
+        }
     }
 
     /**
@@ -286,34 +409,20 @@ class DiskStore<ID : Comparable<ID>>(
         // Write deletion marker FIRST, before modifying index
         // This ensures consistency: if we crash after writing marker but before
         // updating index, buildIndex() will see the marker on restart
+        val idString = idSerializer(id)
+        val idBytes = idString.toByteArray(Charsets.UTF_8)
+        val deletionMarker = "{}".toByteArray(Charsets.UTF_8)
+
+        // Append to end of file
+        raf.seek(raf.length())
+        val markerOffset = raf.filePointer
+
         try {
-            val idString = idSerializer(id)
-            val idBytes = idString.toByteArray(Charsets.UTF_8)
-            val deletionMarker = "{}".toByteArray(Charsets.UTF_8)
-
-            // Append to end of file
-            raf.seek(raf.length())
-
-            if (encryptionKey != null) {
-                // Encrypted format
-                val plainBytes = buildPlainEntry(idBytes, deletionMarker)
-                val encryptedBytes = Encryption.encrypt(plainBytes, encryptionKey)
-                raf.writeInt(encryptedBytes.size)
-                raf.write(encryptedBytes)
-            } else {
-                // Unencrypted format: [ID_LENGTH:4][ID_BYTES][DOC_LENGTH:4][DELETION_MARKER]
-                raf.writeInt(idBytes.size)
-                raf.write(idBytes)
-                raf.writeInt(deletionMarker.size)
-                raf.write(deletionMarker)
-            }
-
-            // Ensure deletion marker is persisted
-            if (syncOnWrite) {
-                raf.fd.sync()
-            }
+            // Same framing as a document; the empty object is what marks it as a tombstone.
+            appendRecord(idBytes, deletionMarker)
         } catch (e: Exception) {
             logger.error(e) { "Failed to write deletion marker for ID=$id" }
+            rollbackPartialAppend(markerOffset, e)
             // Don't modify index if disk write failed - maintain consistency
             return@write false
         }
@@ -321,6 +430,7 @@ class DiskStore<ID : Comparable<ID>>(
         // Only update in-memory state after successful disk write
         index.remove(id)
         deletedIds[id] = true
+        appendCount.incrementAndGet()
         true
     }
 
@@ -435,15 +545,84 @@ class DiskStore<ID : Comparable<ID>>(
     }
 
     /**
+     * Ratio of physical entries in the file to live documents.
+     *
+     * 1.0 immediately after compaction; grows with every update and delete because those append
+     * rather than overwrite. 4.0 means three quarters of the file is reclaimable.
+     *
+     * Returns 0.0 for an empty file, and [Double.MAX_VALUE] when every document has been
+     * deleted but tombstones remain (all of the file is reclaimable).
+     */
+    fun bloatRatio(): Double {
+        val entries = appendCount.get()
+        if (entries <= 0L) return 0.0
+        val live = index.size
+        if (live == 0) return Double.MAX_VALUE
+        return entries.toDouble() / live
+    }
+
+    /**
+     * True when the last index build read the whole file successfully.
+     *
+     * False means a damaged record stopped the scan and some suffix of the file is unreachable.
+     * Reads and writes still work; [compact] refuses to run. See [incompleteTailOffset].
+     */
+    fun isIndexComplete(): Boolean = indexComplete
+
+    /** Offset of the record that stopped the index build, or -1 when the index is complete. */
+    fun incompleteTailOffset(): Long = incompleteTailOffset
+
+    /**
+     * Records the last index build skipped because their payload was corrupt although their
+     * framing was intact. They still occupy file space; [compact] removes them.
+     */
+    fun corruptEntries(): Int = corruptEntries
+
+    /**
+     * Moves [source] onto [target] as a single filesystem operation, so a crash leaves either
+     * the old file or the new one, never neither.
+     *
+     * ATOMIC_MOVE is the guarantee we actually need; it holds for a rename within one
+     * filesystem, which is always the case here because the temp file is a sibling. A few
+     * filesystems reject the flag, so fall back to a plain replace — still far better than
+     * delete-then-rename, since the window shrinks to the rename itself.
+     */
+    private fun atomicMove(source: Path, target: Path) {
+        try {
+            Files.move(
+                source,
+                target,
+                StandardCopyOption.REPLACE_EXISTING,
+                StandardCopyOption.ATOMIC_MOVE
+            )
+        } catch (e: AtomicMoveNotSupportedException) {
+            logger.warn(e) { "Atomic move unsupported for ${target.fileName}; falling back to replace" }
+            Files.move(source, target, StandardCopyOption.REPLACE_EXISTING)
+        }
+    }
+
+    /**
      * Compacts the file by removing deleted documents.
      * Creates a new file with only active documents.
      *
      * Thread-safe: Acquires exclusive write lock, blocking all other operations.
      */
     fun compact() = lock.write {
+        // Refuse to compact an index we know is missing part of the file. Compaction rewrites
+        // the file from the index, so running here would permanently delete every record after
+        // the damaged one — turning recoverable corruption into data loss.
+        if (!indexComplete) {
+            throw StorageException(
+                "Refusing to compact '${dataFile.fileName}': the index is incomplete because a " +
+                        "damaged record at offset $incompleteTailOffset stopped the index build. " +
+                        "Compacting now would permanently discard every record after that offset. " +
+                        "Repair or restore the file first."
+            )
+        }
+
         logger.info { "Compacting disk store: ${index.size} active, ${deletedIds.size} deleted" }
 
-        val tempFile = dataFile.parent.resolve("${dataFile.fileName}.compact")
+        val tempFile = compactTempFile
         val tempRaf = RandomAccessFile(tempFile.toFile(), "rw")
 
         try {
@@ -486,11 +665,10 @@ class DiskStore<ID : Comparable<ID>>(
             // Close old file
             raf.close()
 
-            // Replace old file with new
-            dataFile.toFile().delete()
-            if (!tempFile.toFile().renameTo(dataFile.toFile())) {
-                throw java.io.IOException("Failed to rename compacted file")
-            }
+            // Replace old file with new. This MUST be a single atomic operation: the previous
+            // delete-then-rename left a window where a crash destroyed the collection outright,
+            // because nothing on the reopen path looked for the orphaned temp file.
+            atomicMove(tempFile, dataFile)
 
             // Reopen new file
             raf = RandomAccessFile(dataFile.toFile(), "rw")
@@ -499,6 +677,10 @@ class DiskStore<ID : Comparable<ID>>(
             index.clear()
             index.putAll(newIndex)
             deletedIds.clear()
+
+            // The file now holds exactly one record per live document.
+            appendCount.set(index.size.toLong())
+            corruptEntries = 0
 
             logger.info { "Compaction complete: ${index.size} documents" }
         } catch (e: Exception) {
@@ -569,13 +751,37 @@ class DiskStore<ID : Comparable<ID>>(
      * Builds the in-memory index by scanning the data file.
      * Uses a special marker document to track deletions across restarts.
      * Called only during initialization (no concurrent access).
+     *
+     * Damage is handled in two tiers, because the two kinds are not equally recoverable:
+     *
+     * - **Corrupt payload, intact framing.** The length prefix is sane and the bytes are all
+     *   there, but they will not decrypt (GCM authentication fails) or parse. The record is
+     *   skipped and the scan continues at the next one. Nothing after it is affected.
+     * - **Lost framing.** The length prefix is impossible, or the record runs past the end of the
+     *   file (a torn write from a crash or a full disk). Nothing after this point can be located,
+     *   so the unreadable tail is copied to a `.damaged-<timestamp>` sidecar and the file is
+     *   truncated at the damage. That restores a consistent file: every later append lands at a
+     *   readable boundary instead of behind a wall the next index build cannot see past, which
+     *   is how one torn record used to silently lose every write made after it.
+     *
+     * Only if the sidecar cannot be written does the store fall back to the old behaviour: index
+     * what is readable, leave the file alone, and refuse to compact (see [isIndexComplete]).
      */
     private fun buildIndex() {
-        if (raf.length() == 0L) {
+        // A fresh or emptied file is complete by definition; reset so a reopen after compaction
+        // never inherits a stale incompleteness flag.
+        indexComplete = true
+        incompleteTailOffset = -1
+        appendCount.set(0)
+        corruptEntries = 0
+
+        val fileLength = raf.length()
+        if (fileLength == 0L) {
             return
         }
 
-        logger.info { "Building index from disk file: ${dataFile.fileName}" }
+        val startedAt = System.nanoTime()
+        logger.info { "Building index from disk file: ${dataFile.fileName} ($fileLength bytes)" }
         raf.seek(0)
 
         // Track all IDs and their offsets in order
@@ -585,77 +791,41 @@ class DiskStore<ID : Comparable<ID>>(
         var count = 0
         var skipped = 0
 
-        while (raf.filePointer < raf.length()) {
+        // Offset at which framing was lost, or -1 if the whole file was walked.
+        var damagedAt = -1L
+        var damageReason = ""
+
+        scan@ while (raf.filePointer < fileLength) {
             val offset = raf.filePointer
 
-            try {
-                if (encryptionKey != null) {
-                    // Encrypted format: [TOTAL_LENGTH:4][ENCRYPTED_DATA]
-                    val encryptedLength = raf.readInt()
-                    if (encryptedLength < 0 || encryptedLength > maxDocLength + maxIdLength + 100) {
-                        logger.error { "Invalid encrypted length at offset $offset: $encryptedLength, stopping index build" }
-                        break
-                    }
-
-                    val encryptedBytes = ByteArray(encryptedLength)
-                    raf.readFully(encryptedBytes)
-
-                    val decryptedBytes = Encryption.decrypt(encryptedBytes, encryptionKey)
-                    val parsed = parseDecryptedEntryWithId(decryptedBytes)
-                    if (parsed != null) {
-                        val (id, docBytes) = parsed
-                        // Check if this is a deletion marker (empty JSON object: {})
-                        if (docBytes.size == 2 && docBytes[0] == '{'.code.toByte() && docBytes[1] == '}'.code.toByte()) {
-                            deletionMarkers.add(id)
-                            allEntries.remove(id)
-                        } else {
-                            allEntries[id] = offset
-                            deletionMarkers.remove(id)
-                        }
-                    }
-                } else {
-                    // Unencrypted format: [ID_LENGTH:4][ID_BYTES][DOC_LENGTH:4][DOC_BYTES]
-                    val idLength = raf.readInt()
-
-                    // Sanity check
-                    if (idLength < 0 || idLength > maxIdLength) {
-                        logger.error { "Invalid ID length at offset $offset: $idLength, stopping index build" }
-                        break
-                    }
-
-                    val idBytes = ByteArray(idLength)
-                    raf.readFully(idBytes)
-                    val idString = String(idBytes, Charsets.UTF_8)
-                    val id = idDeserializer(idString)
-
-                    val docLength = raf.readInt()
-
-                    // Sanity check
-                    if (docLength < 0 || docLength > maxDocLength) {
-                        logger.error { "Invalid doc length at offset $offset: $docLength, stopping index build" }
-                        break
-                    }
-
-                    val docBytes = ByteArray(docLength)
-                    raf.readFully(docBytes)
-
+            when (val outcome = readEntryForIndex(offset, fileLength)) {
+                is IndexEntry.Record -> {
+                    val id = outcome.id
+                    val docBytes = outcome.docBytes
                     // Check if this is a deletion marker (empty JSON object: {})
-                    if (docLength == 2 && docBytes[0] == '{'.code.toByte() && docBytes[1] == '}'.code.toByte()) {
-                        // This is a deletion marker
+                    if (docBytes.size == 2 && docBytes[0] == '{'.code.toByte() && docBytes[1] == '}'.code.toByte()) {
                         deletionMarkers.add(id)
                         allEntries.remove(id) // Remove from index if it was there
                     } else {
-                        // Normal document - only add if not marked as deleted later
                         allEntries[id] = offset
                         deletionMarkers.remove(id) // Clear any previous deletion marker
                     }
+                    count++
                 }
-
-                count++
-            } catch (e: Exception) {
-                logger.error(e) { "Failed to read entry at offset $offset, stopping index build" }
-                skipped++
-                break
+                is IndexEntry.CorruptPayload -> {
+                    skipped++
+                    if (skipped <= MAX_LOGGED_CORRUPT_ENTRIES) {
+                        logger.warn(outcome.cause) {
+                            "Skipping corrupt record at offset $offset in ${dataFile.fileName} " +
+                                    "(${outcome.length} bytes, framing intact): ${outcome.reason}"
+                        }
+                    }
+                }
+                is IndexEntry.FramingLost -> {
+                    damagedAt = offset
+                    damageReason = outcome.reason
+                    break@scan
+                }
             }
         }
 
@@ -669,7 +839,157 @@ class DiskStore<ID : Comparable<ID>>(
             deletedIds[id] = true
         }
 
-        logger.info { "Index built: ${index.size} active documents, ${deletedIds.size} deleted, from $count entries (skipped: $skipped)" }
+        // Skipped records are still bytes in the file, so they count towards bloat.
+        appendCount.set((count + skipped).toLong())
+        corruptEntries = skipped
+
+        if (damagedAt >= 0) {
+            quarantineDamagedTail(damagedAt, fileLength, damageReason)
+        }
+
+        val elapsedMs = (System.nanoTime() - startedAt) / 1_000_000
+        logger.info {
+            "Index built: ${index.size} active documents, ${deletedIds.size} deleted, from $count entries " +
+                    "(skipped: $skipped) in ${dataFile.fileName} in $elapsedMs ms"
+        }
+    }
+
+    /** One step of the index scan. On [Record] and [CorruptPayload] the file pointer sits at the next record. */
+    private sealed class IndexEntry<out ID> {
+        class Record<ID>(val id: ID, val docBytes: ByteArray) : IndexEntry<ID>()
+        class CorruptPayload(val length: Int, val reason: String, val cause: Throwable?) : IndexEntry<Nothing>()
+        class FramingLost(val reason: String) : IndexEntry<Nothing>()
+    }
+
+    /**
+     * Reads the record starting at [offset] for the index build.
+     *
+     * Every framing check happens BEFORE any payload is read, against [fileLength], so a torn
+     * record is reported as [IndexEntry.FramingLost] with the pointer still at [offset] rather
+     * than surfacing as an EOFException halfway through.
+     */
+    private fun readEntryForIndex(offset: Long, fileLength: Long): IndexEntry<ID> {
+        if (fileLength - offset < 4) {
+            return IndexEntry.FramingLost("${fileLength - offset} trailing byte(s), too short for a length prefix")
+        }
+
+        if (encryptionKey != null) {
+            // Encrypted format: [TOTAL_LENGTH:4][ENCRYPTED_DATA]
+            val encryptedLength = raf.readInt()
+            if (encryptedLength < minEncryptedLength || encryptedLength > maxDocLength + maxIdLength + 100) {
+                return IndexEntry.FramingLost("invalid encrypted length $encryptedLength")
+            }
+            if (offset + 4 + encryptedLength > fileLength) {
+                return IndexEntry.FramingLost(
+                    "record of $encryptedLength bytes runs ${offset + 4 + encryptedLength - fileLength} bytes " +
+                            "past the end of the file (torn write)"
+                )
+            }
+
+            val encryptedBytes = ByteArray(encryptedLength)
+            raf.readFully(encryptedBytes)
+
+            return try {
+                val decryptedBytes = Encryption.decrypt(encryptedBytes, encryptionKey)
+                val parsed = parseDecryptedEntryWithId(decryptedBytes)
+                    ?: return IndexEntry.CorruptPayload(encryptedLength, "decrypted entry has an invalid layout", null)
+                IndexEntry.Record(parsed.first, parsed.second)
+            } catch (e: Exception) {
+                // GCM authentication failed, or the ID would not deserialize. The framing was
+                // consistent, so the next record is exactly where the length prefix says.
+                IndexEntry.CorruptPayload(encryptedLength, e.message ?: e.javaClass.simpleName, e)
+            }
+        }
+
+        // Unencrypted format: [ID_LENGTH:4][ID_BYTES][DOC_LENGTH:4][DOC_BYTES]
+        val idLength = raf.readInt()
+        if (idLength < minIdLength || idLength > maxIdLength) {
+            return IndexEntry.FramingLost("invalid ID length $idLength")
+        }
+        if (offset + 4 + idLength + 4 > fileLength) {
+            return IndexEntry.FramingLost("ID of $idLength bytes runs past the end of the file (torn write)")
+        }
+
+        val idBytes = ByteArray(idLength)
+        raf.readFully(idBytes)
+
+        val docLength = raf.readInt()
+        if (docLength < minDocLength || docLength > maxDocLength) {
+            return IndexEntry.FramingLost("invalid document length $docLength")
+        }
+        val recordEnd = offset + 4 + idLength + 4 + docLength
+        if (recordEnd > fileLength) {
+            return IndexEntry.FramingLost(
+                "document of $docLength bytes runs ${recordEnd - fileLength} bytes past the end of the file (torn write)"
+            )
+        }
+
+        val docBytes = ByteArray(docLength)
+        raf.readFully(docBytes)
+
+        return try {
+            IndexEntry.Record(idDeserializer(String(idBytes, Charsets.UTF_8)), docBytes)
+        } catch (e: Exception) {
+            IndexEntry.CorruptPayload(4 + idLength + 4 + docLength, "ID would not deserialize: ${e.message}", e)
+        }
+    }
+
+    /**
+     * Moves the unreadable tail of the file, from [damagedAt] to [fileLength], into a sidecar
+     * file and truncates the data file at [damagedAt].
+     *
+     * The bytes are preserved, never deleted: a future repair tool, or a human with a hex editor,
+     * can still get at whatever records the tail contained. What changes is that the data file
+     * is consistent again, so appends made from now on are readable at the next open.
+     *
+     * If the sidecar cannot be written, the file is left untouched and the store runs with an
+     * incomplete index, exactly as before this recovery existed.
+     */
+    private fun quarantineDamagedTail(damagedAt: Long, fileLength: Long, reason: String) {
+        val tailBytes = fileLength - damagedAt
+        val stamp = java.time.LocalDateTime.now()
+            .format(java.time.format.DateTimeFormatter.ofPattern("yyyyMMdd-HHmmss-SSS"))
+        val sidecar = dataFile.resolveSibling("${dataFile.fileName}.damaged-$stamp")
+
+        try {
+            FileChannel.open(
+                sidecar,
+                java.nio.file.StandardOpenOption.CREATE_NEW,
+                java.nio.file.StandardOpenOption.WRITE
+            ).use { out ->
+                var position = damagedAt
+                while (position < fileLength) {
+                    val moved = raf.channel.transferTo(position, fileLength - position, out)
+                    if (moved <= 0L) throw java.io.IOException("transferTo made no progress at $position")
+                    position += moved
+                }
+                out.force(true)
+            }
+            val written = Files.size(sidecar)
+            if (written != tailBytes) {
+                throw java.io.IOException("sidecar holds $written bytes, expected $tailBytes")
+            }
+
+            raf.setLength(damagedAt)
+            raf.fd.sync()
+
+            logger.error {
+                "Recovered ${dataFile.fileName} from a damaged record at offset $damagedAt ($reason): " +
+                        "$tailBytes unreadable trailing byte(s) were moved to ${sidecar.fileName} and the " +
+                        "data file was truncated at the damage. ${index.size} documents are indexed. " +
+                        "Nothing was deleted; the sidecar can be inspected or removed by hand."
+            }
+        } catch (e: Exception) {
+            runCatching { Files.deleteIfExists(sidecar) }
+            indexComplete = false
+            incompleteTailOffset = damagedAt
+            logger.error(e) {
+                "Index for ${dataFile.fileName} is INCOMPLETE: a damaged record at offset $damagedAt ($reason) " +
+                        "stopped the scan $tailBytes bytes before the end of the file, and the tail could not " +
+                        "be quarantined. ${index.size} documents are readable; any records after that offset " +
+                        "are not. Compaction is disabled for this collection until the file is repaired."
+            }
+        }
     }
 
     /**
@@ -713,5 +1033,10 @@ class DiskStore<ID : Comparable<ID>>(
                ((bytes[1].toInt() and 0xFF) shl 16) or
                ((bytes[2].toInt() and 0xFF) shl 8) or
                (bytes[3].toInt() and 0xFF)
+    }
+
+    private companion object {
+        /** Beyond this many corrupt records in one scan, only the summary line is logged. */
+        const val MAX_LOGGED_CORRUPT_ENTRIES = 10
     }
 }
