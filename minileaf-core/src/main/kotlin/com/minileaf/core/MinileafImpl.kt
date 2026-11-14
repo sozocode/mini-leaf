@@ -7,6 +7,7 @@ import com.minileaf.core.id.IdTypeDescriptor
 import com.minileaf.core.repository.IEnhancedSzRepository
 import com.minileaf.core.repository.RepositoryImpl
 import com.minileaf.core.storage.IndexManager
+import com.minileaf.core.storage.DataDirLock
 import com.minileaf.core.storage.StorageEngine
 import com.minileaf.core.storage.cached.CachedStorageEngine
 import com.minileaf.core.storage.file.FileBackedStorageEngine
@@ -31,12 +32,19 @@ class MinileafImpl(
     // Collection name -> CollectionHandle
     private val handles = ConcurrentHashMap<String, CollectionHandle>()
 
+    // Held for the lifetime of this instance so no second process can open the same directory.
+    // Null for memory-only stores and when the lock is disabled by config.
+    private val dataDirLock: DataDirLock?
+
     init {
         logger.info { "Initializing Minileaf with config: $config" }
 
-        // Ensure data directory exists
-        if (!config.memoryOnly) {
+        dataDirLock = if (config.memoryOnly) {
+            null
+        } else {
+            // Ensure data directory exists
             config.dataDir.toFile().mkdirs()
+            if (config.lockDataDir) DataDirLock.acquire(config.dataDir) else null
         }
     }
 
@@ -106,6 +114,10 @@ class MinileafImpl(
 
         collections.clear()
         handles.clear()
+
+        // Released last, after every file is closed, so a successor process that wins the lock
+        // never opens a file this one is still writing.
+        dataDirLock?.close()
 
         logger.info { "Minileaf closed" }
     }

@@ -7,6 +7,9 @@ import com.minileaf.core.config.MinileafConfig
 import com.minileaf.core.storage.StorageEngine
 import com.minileaf.core.storage.StorageStats
 import mu.KotlinLogging
+import java.util.concurrent.Executors
+import java.util.concurrent.ScheduledExecutorService
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.locks.ReentrantReadWriteLock
 import kotlin.concurrent.read
@@ -66,6 +69,9 @@ class CachedStorageEngine<ID : Comparable<ID>>(
         findAndRegisterModules()
     }
 
+    // Background compaction. Null when auto-compaction is disabled.
+    private val maintenance: ScheduledExecutorService?
+
     init {
         val dataDir = config.dataDir.resolve("collections")
         dataDir.toFile().mkdirs()
@@ -74,9 +80,87 @@ class CachedStorageEngine<ID : Comparable<ID>>(
         diskStore = DiskStore(dataFile, idSerializer, idDeserializer, config.syncOnWrite, config.encryptionKey)
 
         val encryptionStatus = if (config.encryptionKey != null) "enabled" else "disabled"
+        val fileBytes = diskStore.fileSize()
         logger.info {
+            // The size line is deliberate: a store that is hundreds of MB for a few KB of live data
+            // used to be invisible without a profiler. Now every boot says so.
             "Initialized cached storage for collection '$collectionName' " +
-                    "(cache: $cacheSize docs, disk: ${diskStore.count()} docs, encryption: $encryptionStatus)"
+                    "(cache: $cacheSize docs, disk: ${diskStore.count()} docs in " +
+                    "${"%.1f".format(fileBytes / 1024.0 / 1024.0)} MB, " +
+                    "bloat ratio ${"%.1f".format(diskStore.bloatRatio())}, encryption: $encryptionStatus)"
+        }
+
+        maintenance = if (config.autoCompactEnabled) {
+            Executors.newSingleThreadScheduledExecutor { r ->
+                // Daemon: a pending compaction must never hold up JVM shutdown.
+                Thread(r, "minileaf-compact-$collectionName").apply { isDaemon = true }
+            }.also { scheduler ->
+                // scheduleWithFixedDelay, not AtFixedRate: a compaction that runs long should
+                // push the next check out, not queue a backlog of them.
+                scheduler.scheduleWithFixedDelay(
+                    ::maybeCompact,
+                    config.autoCompactIntervalMs,
+                    config.autoCompactIntervalMs,
+                    TimeUnit.MILLISECONDS
+                )
+            }
+        } else {
+            null
+        }
+
+        // An install upgrading into this version arrives with a file that has never been
+        // compacted. Check once at startup rather than waiting out the first interval.
+        if (config.autoCompactEnabled) {
+            maintenance?.execute(::maybeCompact)
+        }
+    }
+
+    /**
+     * Compacts this collection's data file when it has accumulated enough dead versions.
+     *
+     * Runs on the maintenance thread, so a caller never blocks on it — though compaction does
+     * take the exclusive lock while it rewrites the file, which briefly blocks reads and writes.
+     *
+     * Never throws: this runs on a scheduled executor, where an escaping exception would
+     * silently cancel all future runs.
+     */
+    private fun maybeCompact() {
+        try {
+            if (!diskStore.isIndexComplete()) {
+                // buildIndex() stopped at a damaged record, so part of the file is not in the
+                // index. Compaction rewrites from the index and would discard that tail for
+                // good. DiskStore.compact() also refuses, but skip here to avoid log noise.
+                logger.warn {
+                    "Skipping auto-compaction of '$collectionName': index is incomplete " +
+                            "(damaged record at offset ${diskStore.incompleteTailOffset()})"
+                }
+                return
+            }
+
+            val fileSize = diskStore.fileSize()
+            val ratio = diskStore.bloatRatio()
+            val corrupt = diskStore.corruptEntries()
+
+            // Corrupt records found at open are compacted away regardless of size: they are
+            // re-skipped (and re-logged) on every boot until something rewrites the file.
+            val bloated = fileSize >= config.autoCompactMinBytes && ratio >= config.autoCompactBloatRatio
+            if (!bloated && corrupt == 0) return
+
+            val startedAt = System.currentTimeMillis()
+            logger.info {
+                "Auto-compacting '$collectionName': ${fileSize / 1024 / 1024} MB, " +
+                        "bloat ratio ${"%.1f".format(ratio)}, corrupt records: $corrupt"
+            }
+
+            compact()
+
+            logger.info {
+                "Auto-compaction of '$collectionName' reclaimed " +
+                        "${(fileSize - diskStore.fileSize()) / 1024 / 1024} MB " +
+                        "in ${System.currentTimeMillis() - startedAt} ms"
+            }
+        } catch (e: Throwable) {
+            logger.error(e) { "Auto-compaction failed for '$collectionName'" }
         }
     }
 
@@ -322,6 +406,21 @@ class CachedStorageEngine<ID : Comparable<ID>>(
             "Closing cached storage for '$collectionName' " +
                     "(hits: ${cacheHits.get()}, misses: ${cacheMisses.get()}, " +
                     "evictions: ${cacheEvictions.get()})"
+        }
+
+        // Stop maintenance BEFORE closing the disk store, and wait for an in-flight compaction
+        // to finish. Closing underneath a running compaction would leave a half-swapped file.
+        maintenance?.let { scheduler ->
+            scheduler.shutdown()
+            try {
+                if (!scheduler.awaitTermination(30, TimeUnit.SECONDS)) {
+                    logger.warn { "Auto-compaction for '$collectionName' did not finish in 30s" }
+                    scheduler.shutdownNow()
+                }
+            } catch (e: InterruptedException) {
+                scheduler.shutdownNow()
+                Thread.currentThread().interrupt()
+            }
         }
 
         cache.clear()

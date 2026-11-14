@@ -59,6 +59,8 @@ class JacksonCodec<T : Any>(
                 findAndRegisterModules()
                 // Register custom serializer/deserializer for ObjectId
                 registerModule(ObjectIdModule())
+                // BsonBinary (UUID subtype 4, generic binary) as {"type": n, "data": base64}
+                registerModule(BsonBinaryModule())
             }
         }
 

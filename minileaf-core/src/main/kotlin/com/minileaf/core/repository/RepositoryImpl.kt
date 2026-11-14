@@ -86,6 +86,15 @@ class RepositoryImpl<T : Any, ID : Comparable<ID>>(
         return Optional.of(codec.fromNode(document))
     }
 
+    override fun deleteAll(): Long {
+        val allDocs = storageEngine.findAll()
+        for ((id, doc) in allDocs) {
+            storageEngine.delete(id)
+            indexManager.onDelete(id, doc)
+        }
+        return allDocs.size.toLong()
+    }
+
     override fun findAll(): List<T> {
         return storageEngine.findAll()
             .map { (_, doc) -> codec.fromNode(doc) }

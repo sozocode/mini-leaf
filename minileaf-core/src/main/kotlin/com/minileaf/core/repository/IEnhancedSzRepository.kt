@@ -53,6 +53,14 @@ interface IEnhancedSzRepository<T, ID : Comparable<ID>> {
     fun deleteById(id: ID): Optional<T>
 
     /**
+     * Deletes every entity in the collection and returns how many were deleted.
+     *
+     * Not atomic: entities are removed one by one, so a concurrent writer can observe a partially
+     * emptied collection, and an entity saved during the call may survive it.
+     */
+    fun deleteAll(): Long
+
+    /**
      * Returns all entities in natural order (_id ascending).
      */
     fun findAll(): List<T>
